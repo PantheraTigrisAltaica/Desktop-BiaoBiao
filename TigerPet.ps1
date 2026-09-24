@@ -1,10 +1,61 @@
-﻿# Tiger Desktop Pet - five actions: walk / rest / wave / ball / shake
-# Windows 10/11, Windows PowerShell 5.1 + WPF
+﻿# Desktop Pet framework - Windows PowerShell 5.1 + WPF
+# Double-click feeding interaction (wait -> eat / roar) is configured in the
+# "interaction" block of assets\actions.json; hidden actions never appear in menus.
+# All pet-specific data (name, actions, frame counts, sizes, ground/center,
+# menu text) lives in assets\actions.json. This script is ASCII-only on
+# purpose: non-ASCII text in a .ps1 breaks parsing on Windows systems whose
+# code page is not UTF-8. Keep all translatable text in the JSON file.
 
 $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $logPath = Join-Path $scriptDir 'TigerPet_error.log'
 try { if (Test-Path -LiteralPath $logPath) { Remove-Item -LiteralPath $logPath -Force } } catch {}
+
+# ---------------------------------------------------------------- config
+function Load-PetConfig([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { throw "Missing config: $path" }
+    $json = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+    $cfg = @{
+        name       = [string]$json.name
+        id         = [string]$json.id
+        assetRatio = [double]$json.asset_ratio
+        moveSpeed  = [double]$json.move_speed
+        order      = @($json.order | ForEach-Object { [string]$_ })
+        all        = @($json.actions.PSObject.Properties | ForEach-Object { [string]$_.Name })
+        actions    = @{}
+        ui         = @{}
+        feed       = $null
+    }
+    foreach ($a in $cfg.all) {
+        $c = $json.actions.$a
+        $cfg.actions[$a] = @{
+            frameCount = [int]$c.frames
+            interval   = [double]$c.interval
+            width      = [double]$c.width
+            height     = [double]$c.height
+            ground     = [double]$c.ground
+            center     = [double]$c.center
+            moves      = [bool]$c.moves
+            weight     = [int]$c.weight
+            label      = [string]$c.label
+            hidden     = [bool]$c.hidden
+            once       = [bool]$c.once
+            sound      = [string]$c.sound
+        }
+    }
+    if ($null -ne $json.interaction) {
+        $i = $json.interaction
+        $cfg.feed = @{
+            from    = @($i.from | ForEach-Object { [string]$_ })
+            wait    = [string]$i.wait
+            timeout = [double]$i.timeout
+            success = [string]$i.success
+            fail    = [string]$i.fail
+        }
+    }
+    foreach ($p in $json.ui.PSObject.Properties) { $cfg.ui[$p.Name] = [string]$p.Value }
+    return $cfg
+}
 
 try {
     Add-Type -AssemblyName PresentationFramework
@@ -26,30 +77,27 @@ try {
     }
 
     $assetDir = Join-Path $scriptDir 'assets'
+    $script:cfg = Load-PetConfig (Join-Path $assetDir 'actions.json')
+    $script:actionOrder = $script:cfg.order
+    $script:actions = $script:cfg.actions
+    $script:ui = $script:cfg.ui
 
-    # ── 动作定义 ────────────────────────────────────────────────────────
-    # ground : 脚底在画面中的高度比例。各动作数值不同（趴着 0.869、坐着 0.988），
-    #          切换时据此补偿窗口位置, 否则老虎会上下瞬移。
-    # center : 身体水平中心比例, 同理用于左右补偿。
-    # moves  : 是否带动窗口横向移动, 只有走路为真。
-    $script:actionOrder = @('walk','rest','wave','ball','shake')
-    $script:actionLabel = @{
-        walk  = '走路 Walk'
-        rest  = '休息 Rest'
-        wave  = '挥爪 Wave'
-        ball  = '玩球 Ball'
-        shake = '抖水 Shake'
-    }
-    $script:actions = @{
-        walk  = @{ frameCount = 10; interval = 0.110; ground = 0.9196; center = 0.5007; moves = $true  }
-        rest  = @{ frameCount = 10; interval = 0.200; ground = 0.8689; center = 0.5022; moves = $false }
-        wave  = @{ frameCount = 10; interval = 0.120; ground = 0.9558; center = 0.4911; moves = $false }
-        ball  = @{ frameCount =  9; interval = 0.130; ground = 0.9672; center = 0.5006; moves = $false }
-        shake = @{ frameCount = 10; interval = 0.085; ground = 0.9486; center = 0.5010; moves = $false }
+    # Weighted pool for random switching (e.g. walk 3, lie 2, others 1)
+    $script:pickPool = @()
+    foreach ($a in $script:actionOrder) {
+        $w = [Math]::Max(1, $script:actions[$a].weight)
+        for ($k = 0; $k -lt $w; $k++) { $script:pickPool += $a }
     }
 
     $script:frames = @{}
-    foreach ($act in $script:actionOrder) {
+    $script:sounds = @{}
+    foreach ($act in $script:cfg.all) {
+        $snd = $script:actions[$act].sound
+        if ($snd) {
+            $p = New-Object System.Media.SoundPlayer (Join-Path $assetDir $snd)
+            $p.Load()
+            $script:sounds[$act] = $p
+        }
         $list = New-Object System.Collections.ArrayList
         for ($i = 1; $i -le $script:actions[$act].frameCount; $i++) {
             $name = ('{0}_{1:d2}.png' -f $act, $i)
@@ -62,7 +110,7 @@ try {
     $script:app.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
 
     $script:window = New-Object System.Windows.Window
-    $script:window.Title = 'Tiger Desktop Pet'
+    $script:window.Title = $script:cfg.name
     $script:window.WindowStyle = [System.Windows.WindowStyle]::None
     $script:window.ResizeMode = [System.Windows.ResizeMode]::NoResize
     $script:window.AllowsTransparency = $true
@@ -88,22 +136,37 @@ try {
     [void]$script:root.Children.Add($script:image)
     $script:window.Content = $script:root
 
-    # 素材画布 880x572, 与窗口同比例 (1.538), 所以 Uniform 缩放不会留黑边
-    $script:baseWidth = 520.0
-    $script:baseHeight = 338.0
     $script:userScale = 1.0
     $script:frameIndex = 0
     $script:direction = 1
-    $script:state = 'walk'
+    $script:state = $script:actionOrder[0]
     $script:paused = $false
     $script:autoSwitch = $true
     $script:speedFactor = 1.0
-    $script:moveSpeed = 78.0
+    $script:moveSpeed = $script:cfg.moveSpeed
     $script:lastFrameTime = 0.0
     $script:nextSwitchTime = 0.0
     $script:clock = [System.Diagnostics.Stopwatch]::StartNew()
     $script:lastTick = $script:clock.Elapsed.TotalSeconds
     $script:rand = New-Object System.Random
+
+    # Feeding interaction: '' (none) | 'waiting' | 'once'
+    $script:interaction = ''
+    $script:returnState = ''
+    $script:waitDeadline = 0.0
+    $script:onceRemaining = 0
+    $script:soundOn = $true
+    # Single clicks are deferred by the system double-click time so that the
+    # first click of a double-click does not switch the action.
+    $script:dblTime = [System.Windows.Forms.SystemInformation]::DoubleClickTime / 1000.0
+    $script:pendingClickAt = 0.0
+    $script:suppressUp = $false
+    # Our own double-click detection in SCREEN coordinates. WPF's click count
+    # compares positions relative to the window, so while the pet walks the
+    # window slides under a still cursor and the second click never counts.
+    $script:lastDownAt = -10.0
+    $script:lastDownPos = New-Object System.Windows.Point(-9999, -9999)
+    $script:dblDist = [Math]::Max(4.0, [double][System.Windows.Forms.SystemInformation]::DoubleClickSize.Width)
 
     $script:dragging = $false
     $script:moved = $false
@@ -124,25 +187,43 @@ try {
         return $pt
     }
 
-    # ── 锚点模型 ────────────────────────────────────────────────────────
-    # anchorX / anchorY = 老虎"脚底中心"在屏幕上的位置, 这才是老虎真正站的地方。
-    # 窗口位置每次都由锚点反算, 而不是反过来。原因:
-    #   1) 各动作脚底在画面里的高度不同, 直接比较窗口矩形会让老虎上下跳;
-    #   2) 窗口里有大片透明区, 用窗口矩形做边界限制会把老虎推离任务栏;
-    #   3) 限制只作用于显示位置、不改锚点, 所以在屏幕边缘放大再缩小能回到原位。
+    # ---------------------------------------------------------- anchor model
+    # anchorX/anchorY = screen position of the pet's feet (body centre, ground).
+    # The window is always derived from the anchor, never the other way round:
+    #  * every action has its own canvas size and its own ground/centre ratios;
+    #  * the window contains transparent margins, so clamping the window rect
+    #    would push the pet off the taskbar;
+    #  * clamping changes only the displayed rect, so zooming in at a screen
+    #    edge and zooming out again returns the pet to exactly where it was.
     $script:anchorX = 0.0
     $script:anchorY = 0.0
 
+    # When the pet faces left the image is mirrored inside the window, so the
+    # body centre sits at (1 - center) of the window width, not at center.
+    function Get-EffCenter([string]$act) {
+        $c = $script:actions[$act].center
+        if ($script:direction -lt 0) { return 1.0 - $c }
+        return $c
+    }
+
+    function Get-ActionSize([string]$act) {
+        $c = $script:actions[$act]
+        $w = $c.width / $script:cfg.assetRatio * $script:userScale
+        $h = $c.height / $script:cfg.assetRatio * $script:userScale
+        return @($w, $h)
+    }
+
     function Apply-Anchor {
         $cfg = $script:actions[$script:state]
-        $w = $script:baseWidth * $script:userScale
-        $h = $script:baseHeight * $script:userScale
+        $size = Get-ActionSize $script:state
+        $w = $size[0]; $h = $size[1]
         $script:window.Width = $w
         $script:window.Height = $h
-        $left = $script:anchorX - ($w * $cfg.center)
+        $left = $script:anchorX - ($w * (Get-EffCenter $script:state))
         $top  = $script:anchorY - ($h * $cfg.ground)
         $work = Get-WorkArea
-        # 只约束脚底不低于工作区底边; 脚下的透明留白可以伸到任务栏后面
+        # Only the feet must stay above the work-area bottom; the transparent
+        # margin under the feet may extend behind the taskbar.
         if (($top + $h * $cfg.ground) -gt $work.Bottom) { $top = $work.Bottom - ($h * $cfg.ground) }
         if ($top -lt $work.Top) { $top = $work.Top }
         if ($left -lt $work.Left) { $left = $work.Left }
@@ -151,10 +232,9 @@ try {
         $script:window.Top = $top
     }
 
-    # 拖动结束或走到屏幕边缘时, 以实际显示位置为准回写锚点
     function Sync-AnchorFromWindow {
         $cfg = $script:actions[$script:state]
-        $script:anchorX = $script:window.Left + ($script:window.Width * $cfg.center)
+        $script:anchorX = $script:window.Left + ($script:window.Width * (Get-EffCenter $script:state))
         $script:anchorY = $script:window.Top + ($script:window.Height * $cfg.ground)
     }
 
@@ -168,14 +248,23 @@ try {
         return $script:window.Top + ($script:window.Height * $script:actions[$script:state].ground)
     }
     function Get-CenterX {
-        return $script:window.Left + ($script:window.Width * $script:actions[$script:state].center)
+        return $script:window.Left + ($script:window.Width * (Get-EffCenter $script:state))
     }
 
     function Set-PetScale([double]$newScale) {
         if ($newScale -lt 0.55) { $newScale = 0.55 }
         if ($newScale -gt 1.65) { $newScale = 1.65 }
         $script:userScale = $newScale
-        Apply-Anchor          # 锚点不变, 所以是原地变大变小
+        Apply-Anchor
+    }
+
+    function Reset-Position {
+        # Feet 4 px above the taskbar, body 30 px + half a window from the left edge
+        $work = Get-WorkArea
+        $size = Get-ActionSize $script:state
+        $script:anchorX = $work.Left + 30 + ($size[0] * (Get-EffCenter $script:state))
+        $script:anchorY = $work.Bottom - 4
+        Apply-Anchor
     }
 
     function Show-Frame([int]$index) {
@@ -194,14 +283,16 @@ try {
 
     function Set-Action([string]$act) {
         if (-not $script:actions.ContainsKey($act)) { return }
-        # 锚点不变, 只换动作参数再反算窗口: 各动作 ground 不同 (趴着 0.869 /
-        # 坐着 0.988) 也不会让老虎上下瞬移
+        # The anchor stays put; only the action parameters change.
         $script:state = $act
         $script:frameIndex = 0
         $script:lastFrameTime = $script:clock.Elapsed.TotalSeconds
         Apply-Anchor
         Show-Frame 0
         Schedule-NextSwitch
+        if ($script:soundOn -and $script:sounds.ContainsKey($act)) {
+            try { $script:sounds[$act].Play() } catch {}
+        }
         foreach ($k in $script:actionOrder) {
             if ($script:actionItems.ContainsKey($k)) { $script:actionItems[$k].IsChecked = ($k -eq $act) }
         }
@@ -213,11 +304,46 @@ try {
     }
 
     function Pick-RandomAction {
-        # 走路权重高一些, 桌面上有移动才像活的
-        $pool = @('walk','walk','walk','rest','rest','wave','ball','shake')
-        $pick = $pool[$script:rand.Next(0, $pool.Count)]
+        $pick = $script:pickPool[$script:rand.Next(0, $script:pickPool.Count)]
         if ($pick -eq $script:state) { Schedule-NextSwitch; return }
         Set-Action $pick
+    }
+
+    function Start-Once([string]$act) {
+        # One-shot action: plays every frame once, then End-Interaction restores
+        # the action the pet was doing before the double-click.
+        $script:interaction = 'once'
+        $script:onceRemaining = $script:actions[$act].frameCount
+        Set-Action $act
+    }
+
+    function End-Interaction {
+        $back = $script:returnState
+        $script:interaction = ''
+        $script:returnState = ''
+        if ($back) { Set-Action $back }
+    }
+
+    function On-DoubleClick {
+        $f = $script:cfg.feed
+        if ($null -eq $f) { return }
+        if ($script:interaction -eq 'waiting') { Start-Once $f.success; return }   # fed within time
+        if ($script:interaction -ne '') { return }                                   # eating / roaring
+        if ($f.from -notcontains $script:state) { return }                           # e.g. ball, shake
+        $script:returnState = $script:state
+        $script:interaction = 'waiting'
+        $script:waitDeadline = $script:clock.Elapsed.TotalSeconds + $f.timeout
+        Set-Action $f.wait
+    }
+
+    function Choose-Action([string]$act) {
+        # A manual choice cancels any feeding interaction and turns
+        # auto-switching off so it is not replaced at once
+        $script:interaction = ''
+        $script:returnState = ''
+        $script:autoSwitch = $false
+        if ($script:autoItem) { $script:autoItem.IsChecked = $false }
+        Set-Action $act
     }
 
     function Stop-Pet {
@@ -236,24 +362,47 @@ try {
         if ($dt -gt 0.12) { $dt = 0.016 }
         $script:lastTick = $now
 
-        if ($script:paused) { return }
+        if ($script:paused) {
+            if ($script:interaction -eq 'waiting') { $script:waitDeadline += $dt }
+            return
+        }
+
+        if ($script:pendingClickAt -gt 0 -and $now -ge $script:pendingClickAt) {
+            $script:pendingClickAt = 0.0
+            if ($script:interaction -eq '') {
+                $script:autoSwitch = $false
+                if ($script:autoItem) { $script:autoItem.IsChecked = $false }
+                Next-Action
+            }
+        }
 
         $cfg = $script:actions[$script:state]
         $interval = $cfg.interval / $script:speedFactor
         if (($now - $script:lastFrameTime) -ge $interval) {
             $steps = [Math]::Max(1, [int][Math]::Floor(($now - $script:lastFrameTime) / $interval))
             $script:lastFrameTime += $steps * $interval
+            if ($script:interaction -eq 'once') {
+                $script:onceRemaining -= $steps
+                if ($script:onceRemaining -le 0) { End-Interaction; return }
+            }
             Show-Frame ($script:frameIndex + $steps)
         }
 
-        if ($cfg.moves -and -not $script:dragging) {
+        if ($script:interaction -eq 'waiting' -and $now -ge $script:waitDeadline) {
+            Start-Once $script:cfg.feed.fail
+            return
+        }
+
+        # While a click may still become a double-click the pet stands still,
+        # so the second click lands on the same spot of its body.
+        if ($cfg.moves -and -not $script:dragging -and -not ($script:pendingClickAt -gt 0)) {
             $work = Get-WorkArea
             $script:anchorX += ($script:moveSpeed * $script:speedFactor * $dt * $script:direction * $script:userScale)
             Apply-Anchor
             if (($script:window.Left + $script:window.Width) -ge $work.Right) {
                 $script:direction = -1
                 $script:flip.ScaleX = -1
-                Sync-AnchorFromWindow     # 贴边后锚点不能继续往外跑
+                Sync-AnchorFromWindow
             } elseif ($script:window.Left -le $work.Left) {
                 $script:direction = 1
                 $script:flip.ScaleX = 1
@@ -261,13 +410,29 @@ try {
             }
         }
 
-        if ($script:autoSwitch -and -not $script:dragging -and $now -ge $script:nextSwitchTime) {
+        if ($script:autoSwitch -and $script:interaction -eq '' -and -not $script:dragging -and $now -ge $script:nextSwitchTime) {
             Pick-RandomAction
         }
     })
 
     $script:window.Add_MouseLeftButtonDown({
         param($sender,$e)
+        if ($null -ne $script:cfg.feed) {
+            $tNow = $script:clock.Elapsed.TotalSeconds
+            $pNow = Get-CursorDip
+            $isDbl = (($tNow - $script:lastDownAt) -le $script:dblTime) -and
+                     ([Math]::Abs($pNow.X - $script:lastDownPos.X) -le $script:dblDist) -and
+                     ([Math]::Abs($pNow.Y - $script:lastDownPos.Y) -le $script:dblDist)
+            if ($isDbl) {
+                $script:lastDownAt = -10.0        # a third click starts a new sequence
+                $script:pendingClickAt = 0.0      # cancel the deferred single click
+                $script:suppressUp = $true        # the matching button-up is not a click
+                On-DoubleClick
+            } else {
+                $script:lastDownAt = $tNow
+                $script:lastDownPos = $pNow
+            }
+        }
         $script:dragging = $true
         $script:moved = $false
         $script:dragStartMouse = Get-CursorDip
@@ -302,12 +467,17 @@ try {
         try { $script:window.ReleaseMouseCapture() } catch {}
         if ($script:moved) {
             Keep-On-Screen
-        } else {
-            # 原地单击 = 换下一个动作, 并停止自动切换, 免得刚选完就被换掉
+        } elseif ($script:suppressUp) {
+            # second half of a double-click: already handled
+        } elseif ($null -eq $script:cfg.feed) {
+            # No double-click interaction for this pet: act on the click at once
             $script:autoSwitch = $false
             if ($script:autoItem) { $script:autoItem.IsChecked = $false }
             Next-Action
+        } else {
+            $script:pendingClickAt = $script:clock.Elapsed.TotalSeconds + $script:dblTime
         }
+        $script:suppressUp = $false
         $e.Handled = $true
     })
 
@@ -318,6 +488,7 @@ try {
         $e.Handled = $true
     })
 
+    # ---------------------------------------------------------------- menus
     $script:menu = New-Object System.Windows.Controls.ContextMenu
     function Add-MenuItem([string]$header, [scriptblock]$handler) {
         $item = New-Object System.Windows.Controls.MenuItem
@@ -330,22 +501,17 @@ try {
     $script:actionItems = @{}
     foreach ($act in $script:actionOrder) {
         $item = New-Object System.Windows.Controls.MenuItem
-        $item.Header = $script:actionLabel[$act]
+        $item.Header = $script:actions[$act].label
         $item.IsCheckable = $true
         $item.Tag = $act
-        $item.Add_Click({
-            param($s,$e)
-            $script:autoSwitch = $false
-            if ($script:autoItem) { $script:autoItem.IsChecked = $false }
-            Set-Action ([string]$s.Tag)
-        })
+        $item.Add_Click({ param($s,$e) Choose-Action ([string]$s.Tag) })
         [void]$script:menu.Items.Add($item)
         $script:actionItems[$act] = $item
     }
     [void]$script:menu.Items.Add((New-Object System.Windows.Controls.Separator))
 
     $script:autoItem = New-Object System.Windows.Controls.MenuItem
-    $script:autoItem.Header = '自动切换动作 Auto'
+    $script:autoItem.Header = $script:ui.auto
     $script:autoItem.IsCheckable = $true
     $script:autoItem.IsChecked = $true
     $script:autoItem.Add_Click({
@@ -355,7 +521,7 @@ try {
     [void]$script:menu.Items.Add($script:autoItem)
 
     $script:pauseItem = New-Object System.Windows.Controls.MenuItem
-    $script:pauseItem.Header = '暂停 Pause'
+    $script:pauseItem.Header = $script:ui.pause
     $script:pauseItem.IsCheckable = $true
     $script:pauseItem.Add_Click({
         $script:paused = $script:pauseItem.IsChecked
@@ -365,43 +531,52 @@ try {
         }
     })
     [void]$script:menu.Items.Add($script:pauseItem)
+
+    # The sound toggle only appears for pets that actually have sounds
+    if ($script:sounds.Count -gt 0) {
+        $script:soundItem = New-Object System.Windows.Controls.MenuItem
+        $script:soundItem.Header = $script:ui.sound
+        $script:soundItem.IsCheckable = $true
+        $script:soundItem.IsChecked = $true
+        $script:soundItem.Add_Click({
+            $script:soundOn = $script:soundItem.IsChecked
+            if (-not $script:soundOn) { foreach ($p in $script:sounds.Values) { try { $p.Stop() } catch {} } }
+        })
+        [void]$script:menu.Items.Add($script:soundItem)
+    }
     [void]$script:menu.Items.Add((New-Object System.Windows.Controls.Separator))
 
-    [void](Add-MenuItem '正常速度 Normal' { $script:speedFactor = 1.0 })
-    [void](Add-MenuItem '慢速 Slow'       { $script:speedFactor = 0.72 })
-    [void](Add-MenuItem '快速 Fast'       { $script:speedFactor = 1.35 })
+    [void](Add-MenuItem $script:ui.normal { $script:speedFactor = 1.0 })
+    [void](Add-MenuItem $script:ui.slow   { $script:speedFactor = 0.72 })
+    [void](Add-MenuItem $script:ui.fast   { $script:speedFactor = 1.35 })
     [void]$script:menu.Items.Add((New-Object System.Windows.Controls.Separator))
 
     $script:topItem = New-Object System.Windows.Controls.MenuItem
-    $script:topItem.Header = '窗口置顶 Always on top'
+    $script:topItem.Header = $script:ui.top
     $script:topItem.IsCheckable = $true
     $script:topItem.IsChecked = $true
     $script:topItem.Add_Click({ $script:window.Topmost = $script:topItem.IsChecked })
     [void]$script:menu.Items.Add($script:topItem)
 
-    [void](Add-MenuItem '放大 Larger'      { Set-PetScale ($script:userScale + 0.12) })
-    [void](Add-MenuItem '缩小 Smaller'     { Set-PetScale ($script:userScale - 0.12) })
-    [void](Add-MenuItem '默认大小 Default' { Set-PetScale 1.0 })
+    [void](Add-MenuItem $script:ui.larger  { Set-PetScale ($script:userScale + 0.12) })
+    [void](Add-MenuItem $script:ui.smaller { Set-PetScale ($script:userScale - 0.12) })
+    [void](Add-MenuItem $script:ui.default { Set-PetScale 1.0 })
+    [void](Add-MenuItem $script:ui.reset   { Reset-Position })
     [void]$script:menu.Items.Add((New-Object System.Windows.Controls.Separator))
-    [void](Add-MenuItem '退出 Exit' { Stop-Pet })
+    [void](Add-MenuItem $script:ui.quit { Stop-Pet })
     $script:root.ContextMenu = $script:menu
 
     $script:trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
     foreach ($act in $script:actionOrder) {
         $ti = New-Object System.Windows.Forms.ToolStripMenuItem
-        $ti.Text = $script:actionLabel[$act]
+        $ti.Text = $script:actions[$act].label
         $ti.Tag = $act
-        $ti.Add_Click({
-            param($s,$e)
-            $script:autoSwitch = $false
-            if ($script:autoItem) { $script:autoItem.IsChecked = $false }
-            Set-Action ([string]$s.Tag)
-        })
+        $ti.Add_Click({ param($s,$e) Choose-Action ([string]$s.Tag) })
         [void]$script:trayMenu.Items.Add($ti)
     }
     [void]$script:trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
     $showItem = New-Object System.Windows.Forms.ToolStripMenuItem
-    $showItem.Text = '回到屏幕内 Show tiger'
+    $showItem.Text = $script:ui.reset
     $showItem.Add_Click({
         $script:window.Show(); $script:window.Topmost = $script:topItem.IsChecked
         Reset-Position
@@ -409,27 +584,19 @@ try {
     })
     [void]$script:trayMenu.Items.Add($showItem)
     $exitItem = New-Object System.Windows.Forms.ToolStripMenuItem
-    $exitItem.Text = '退出 Exit'
+    $exitItem.Text = $script:ui.quit
     $exitItem.Add_Click({ Stop-Pet })
     [void]$script:trayMenu.Items.Add($exitItem)
 
     $script:tray = New-Object System.Windows.Forms.NotifyIcon
     $script:tray.Icon = [System.Drawing.SystemIcons]::Application
-    $script:tray.Text = 'Tiger Desktop Pet'
+    $script:tray.Text = $script:cfg.name
     $script:tray.ContextMenuStrip = $script:trayMenu
     $script:tray.Visible = $true
     $script:tray.Add_DoubleClick({ $script:window.Show(); $script:window.Activate() })
 
-    function Reset-Position {
-        # 脚底站在任务栏上方 4px, 身体离左边缘留出半个窗口宽
-        $work = Get-WorkArea
-        $script:anchorX = $work.Left + 30 + ($script:baseWidth * $script:userScale * $script:actions[$script:state].center)
-        $script:anchorY = $work.Bottom - 4
-        Apply-Anchor
-    }
-
     Reset-Position
-    Set-Action 'walk'
+    Set-Action $script:actionOrder[0]
 
     $script:window.Add_KeyDown({
         param($sender,$e)
@@ -452,8 +619,8 @@ catch {
     try {
         Add-Type -AssemblyName PresentationFramework -ErrorAction SilentlyContinue
         [System.Windows.MessageBox]::Show(
-            "Tiger Desktop Pet failed to start.`r`nError log:`r`n$logPath`r`n`r`n$msg",
-            'Tiger Desktop Pet - Error',
+            "Desktop pet failed to start.`r`nError log:`r`n$logPath`r`n`r`n$msg",
+            'Desktop Pet - Error',
             [System.Windows.MessageBoxButton]::OK,
             [System.Windows.MessageBoxImage]::Error
         ) | Out-Null
